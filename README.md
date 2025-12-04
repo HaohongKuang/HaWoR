@@ -36,8 +36,6 @@ conda activate hawor
 pip install torch==1.13.0+cu117 torchvision==0.14.0+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
 # Install requirements
 pip install -r requirements.txt
-pip install pytorch-lightning==2.2.4 --no-deps
-pip install lightning-utilities torchmetrics==1.4.0
 ```
 
 ### Install masked DROID-SLAM:
@@ -78,7 +76,37 @@ python demo.py --video_path ./example/video_0.mp4 --vis_mode cam
 ```
 
 ## Training
-The training code will be released soon. 
+
+### Dataset preparation
+
+Training expects a manifest with per-frame annotations that can be loaded from either a JSON (`{"samples": [...]}`) or NPZ file (`np.savez('train_annotations.npz', samples=np.array(list_of_dicts, dtype=object))`). Each sample dictionary should contain at least:
+
+- `img_path`: Path to the RGB frame (absolute or relative to `--image-root`).
+- `sequence_id` and `frame_id`: Used to build temporal windows.
+- `bbox` (x1, y1, x2, y2) or explicit `center` and `scale` (bbox size / 200).
+- `gt_cam_j2d`: 2D joints in the original image frame (N x 2).
+- `gt_cam_full_pose`: MANO axis-angle pose (48 values for 16 joints).
+- `gt_cam_betas`: MANO shape (10 values).
+- `gt_j3d_wo_trans`: 3D joints without translation. If omitted, joints are regenerated from MANO parameters when MANO models are available under `_DATA/data`.
+- Optional `img_center` and `img_focal` (pixel coords / focal length). If absent, they are estimated from image size.
+
+Place your MANO assets under `_DATA/data/mano/` (right hand) and `_DATA/data_left/mano_left/` as described in the installation section. The default config points to `_DATA/data/mano_mean_params.npz` for MANO priors.
+
+### Launching training
+
+1. Create or download a model configuration (see `hawor/configs/__init__.py` for defaults) and adjust dataset paths if needed.
+2. Start training with the pure PyTorch entrypoint:
+
+```bash
+python scripts/train_hawor.py \
+  --config path/to/config.yaml \
+  --train-annotations /path/to/train_annotations.npz \
+  --val-annotations /path/to/val_annotations.npz \
+  --image-root /path/to/frames \
+  --output-dir outputs/hawor
+```
+
+Use `--resume-from-checkpoint` to continue from a saved checkpoint. TensorBoard logs are written under `outputs/tensorboard/hawor/`, and checkpoints under `outputs/checkpoints/` by default (`best.ckpt` mirrors the lowest validation loss). Add `--no-image-log` to skip image visualizations and speed up logging. Update `NUM_GPUS` in the config or pass `--num-gpus` to control GPU usage.
 
 ## Acknowledgements
 Parts of the code are taken or adapted from the following repos:
