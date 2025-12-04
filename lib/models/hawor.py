@@ -1,11 +1,12 @@
 import einops
 import numpy as np
 import torch
-import pytorch_lightning as pl
-from typing import Dict
+from torch import nn
+from torch.nn import functional as F
 from torchvision.utils import make_grid
 
 from tqdm import tqdm
+from typing import Dict
 from yacs.config import CfgNode
 
 from lib.datasets.track_dataset import TrackDatasetEval
@@ -24,7 +25,7 @@ from .mano_wrapper import MANO
 log = get_pylogger(__name__)
 idx = 0
 
-class HAWOR(pl.LightningModule):
+class HAWOR(nn.Module):
 
     def __init__(self, cfg: CfgNode):
         """
@@ -33,9 +34,6 @@ class HAWOR(pl.LightningModule):
             cfg (CfgNode): Config file as a yacs CfgNode
         """
         super().__init__()
-
-        # Save hyperparameters
-        self.save_hyperparameters(logger=False, ignore=['init_renderer'])
 
         self.cfg = cfg
         self.crop_size = cfg.MODEL.IMAGE_SIZE
@@ -101,9 +99,9 @@ class HAWOR(pl.LightningModule):
             self.mano_head = torch.compile(self.mano_head)
 
         # Define loss functions
-        # self.keypoint_3d_loss = Keypoint3DLoss(loss_type='l1')
-        # self.keypoint_2d_loss = Keypoint2DLoss(loss_type='l1')
-        # self.mano_parameter_loss = ParameterLoss()
+        self.keypoint_3d_loss = self._keypoint_l1_loss
+        self.keypoint_2d_loss = self._keypoint_l1_loss
+        self.mano_parameter_loss = self._mano_parameter_loss
 
         # Instantiate MANO model
         mano_cfg = {k.lower(): v for k,v in dict(cfg.MANO).items()}
@@ -111,9 +109,6 @@ class HAWOR(pl.LightningModule):
 
         # Buffer that shows whetheer we need to initialize ActNorm layers
         self.register_buffer('initialized', torch.tensor(False))
-
-        # Disable automatic optimization since we use adversarial training
-        self.automatic_optimization = False
 
         if cfg.MODEL.get('LOAD_WEIGHTS', None):
             whole_state_dict = torch.load(cfg.MODEL.LOAD_WEIGHTS, map_location='cpu')['state_dict']
@@ -128,19 +123,6 @@ class HAWOR(pl.LightningModule):
             all_params += list(self.motion_module.parameters())
         all_params += list(self.backbone.parameters())
         return all_params
-
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        """
-        Setup model and distriminator Optimizers
-        Returns:
-            Tuple[torch.optim.Optimizer, torch.optim.Optimizer]: Model and discriminator optimizers
-        """
-        param_groups = [{'params': filter(lambda p: p.requires_grad, self.get_parameters()), 'lr': self.cfg.TRAIN.LR}]
-
-        optimizer = torch.optim.AdamW(params=param_groups,
-                                        # lr=self.cfg.TRAIN.LR,
-                                        weight_decay=self.cfg.TRAIN.WEIGHT_DECAY)
-        return optimizer
 
     def forward_step(self, batch: Dict, train: bool = False) -> Dict:
         """
@@ -287,17 +269,38 @@ class HAWOR(pl.LightningModule):
 
         return loss
 
-    # Tensoroboard logging should run from first rank only
-    @pl.utilities.rank_zero.rank_zero_only
-    def tensorboard_logging(self, batch: Dict, output: Dict, step_count: int, train: bool = True, write_to_summary_writer: bool = True, render_log: bool = True) -> None:
-        """
-        Log results to Tensorboard
-        Args:
-            batch (Dict): Dictionary containing batch data
-            output (Dict): Dictionary containing the regression output
-            step_count (int): Global training step count
-            train (bool): Flag indicating whether it is training or validation mode
-        """
+    @staticmethod
+    def _keypoint_l1_loss(pred, gt):
+        """L1 keypoint loss that respects confidence weights."""
+        pred_coords = pred
+        pred_conf = torch.ones_like(pred_coords[..., :1])
+        if gt.shape[-1] > pred_coords.shape[-1]:
+            gt_conf = gt[..., -1:]
+        else:
+            gt_conf = torch.ones_like(pred_conf)
+        gt_coords = gt[..., :pred_coords.shape[-1]]
+
+        conf = gt_conf * pred_conf
+        loss = (conf * (pred_coords - gt_coords).abs()).sum() / (conf.sum() + 1e-8)
+        return loss
+
+    @staticmethod
+    def _mano_parameter_loss(pred, gt):
+        return F.smooth_l1_loss(pred, gt)
+
+    def tensorboard_logging(
+        self,
+        batch: Dict,
+        output: Dict,
+        step_count: int,
+        writer=None,
+        train: bool = True,
+        render_log: bool = True,
+    ) -> None:
+        """Log scalars and optional images to TensorBoard."""
+
+        if writer is None:
+            return
 
         mode = 'train' if train else 'val'
         batch_size = output['pred_keypoints_2d'].shape[0]
@@ -306,26 +309,26 @@ class HAWOR(pl.LightningModule):
         images = images + torch.tensor([0.485, 0.456, 0.406], device=images.device).reshape(1,3,1,1)
 
         losses = output['losses']
-        if write_to_summary_writer:
-            summary_writer = self.logger.experiment
-            for loss_name, val in losses.items():
-                summary_writer.add_scalar(mode +'/' + loss_name, val.detach().item(), step_count)
-        
-        if render_log:
-            gt_keypoints_2d = batch['gt_cam_j2d'].flatten(0,1).clone()
-            pred_keypoints_2d = output['pred_keypoints_2d'].clone().detach().reshape(batch_size, -1, 2)
-            gt_project_j2d = pred_keypoints_2d
-            # gt_project_j2d = output['gt_project_j2d'].clone().detach().reshape(batch_size, -1, 2)
+        for loss_name, val in losses.items():
+            writer.add_scalar(mode +'/' + loss_name, val.detach().item(), step_count)
 
-            num_images = 4
-            skip=16
+        if not render_log:
+            return
 
-            predictions = self.visualize_tensorboard(images[:num_images*skip:skip].cpu().numpy(),
-                                                pred_keypoints_2d[:num_images*skip:skip].cpu().numpy(),
-                                                gt_project_j2d[:num_images*skip:skip].cpu().numpy(),
-                                                gt_keypoints_2d[:num_images*skip:skip].cpu().numpy(),
-                                                )
-            summary_writer.add_image('%s/predictions' % mode, predictions, step_count)
+        gt_keypoints_2d = batch['gt_cam_j2d'].flatten(0,1).clone()
+        pred_keypoints_2d = output['pred_keypoints_2d'].clone().detach().reshape(batch_size, -1, 2)
+        gt_project_j2d = pred_keypoints_2d
+
+        num_images = 4
+        skip = 16
+
+        predictions = self.visualize_tensorboard(
+            images[:num_images*skip:skip].cpu().numpy(),
+            pred_keypoints_2d[:num_images*skip:skip].cpu().numpy(),
+            gt_project_j2d[:num_images*skip:skip].cpu().numpy(),
+            gt_keypoints_2d[:num_images*skip:skip].cpu().numpy(),
+        )
+        writer.add_image(f'{mode}/predictions', predictions, step_count)
     
 
     def forward(self, batch: Dict) -> Dict:
@@ -337,44 +340,6 @@ class HAWOR(pl.LightningModule):
             Dict: Dictionary containing the regression output
         """
         return self.forward_step(batch, train=False)
-
-    def training_step(self, joint_batch: Dict, batch_idx: int) -> Dict:
-        """
-        Run a full training step
-        Args:
-            joint_batch (Dict): Dictionary containing image and mocap batch data
-            batch_idx (int): Unused.
-            batch_idx (torch.Tensor): Unused.
-        Returns:
-            Dict: Dictionary containing regression output.
-        """
-        batch = joint_batch['img']
-        optimizer = self.optimizers(use_pl_optimizer=True)
-
-        batch_size = batch['img'].shape[0]
-        output = self.forward_step(batch, train=True)
-        # pred_mano_params = output['pred_mano_params']
-        loss = self.compute_loss(batch, output, train=True)
-        
-        # Error if Nan
-        if torch.isnan(loss):
-            raise ValueError('Loss is NaN')
-
-        optimizer.zero_grad()
-        self.manual_backward(loss)
-        # Clip gradient
-        if self.cfg.TRAIN.get('GRAD_CLIP_VAL', 0) > 0:
-            gn = torch.nn.utils.clip_grad_norm_(self.get_parameters(), self.cfg.TRAIN.GRAD_CLIP_VAL, error_if_nonfinite=True)
-            self.log('train/grad_norm', gn, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
-        optimizer.step()
-        
-        # if self.global_step > 0 and self.global_step % self.cfg.GENERAL.LOG_STEPS == 0:
-        if self.global_step > 0 and self.global_step % 100 == 0:
-            self.tensorboard_logging(batch, output, self.global_step, train=True, render_log=self.cfg.TRAIN.get("RENDER_LOG", True))
-
-        self.log('train/loss', output['losses']['loss'], on_step=True, on_epoch=True, prog_bar=True, logger=False, batch_size=batch_size)
-
-        return output
 
     def inference(self, imgfiles, boxes, img_focal, img_center, device='cuda', do_flip=False):
         db = TrackDatasetEval(imgfiles, boxes, img_focal=img_focal, 
@@ -438,23 +403,6 @@ class HAWOR(pl.LightningModule):
         
         return results
 
-    def validation_step(self, batch: Dict, batch_idx: int, dataloader_idx=0) -> Dict:
-        """
-        Run a validation step and log to Tensorboard
-        Args:
-            batch (Dict): Dictionary containing batch data
-            batch_idx (int): Unused.
-        Returns:
-            Dict: Dictionary containing regression output.
-        """
-        # batch_size = batch['img'].shape[0]
-        output = self.forward_step(batch, train=False)
-        loss = self.compute_loss(batch, output, train=False)
-        output['loss'] = loss
-        self.tensorboard_logging(batch, output, self.global_step, train=False)
-
-        return output
-    
     def visualize_tensorboard(self, images, pred_keypoints, gt_project_j2d, gt_keypoints):
         pred_keypoints = 256 * (pred_keypoints + 0.5)
         gt_keypoints = 256 * (gt_keypoints + 0.5)
